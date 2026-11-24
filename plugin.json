@@ -1,0 +1,14 @@
+{
+  "name": "gemini-codex-jev",
+  "displayName": "Gemini × Jev × Codex 三模型协同编排套件",
+  "version": "0.1.0",
+  "description": "连接 Gemini 深度思考、TypeSafe Jev 毫秒级校准判别门控与本地 OpenAI Codex 沙盒执行/子智能体引擎的跨模型协同插件。",
+  "author": "Howardyh",
+  "homepage": "https://github.com/Howardyh/gemini-codex-jev",
+  "repository": "https://github.com/Howardyh/gemini-codex-jev",
+  "suggestedPrompts": [
+    "使用 Jev 评估当前任务类型与风险，再调度 Codex 在沙盒中实现并完成交叉审查",
+    "调用 bridge_status 检查本机 Codex 模型池与 TypeSafe Jev 引擎就绪状态",
+    "委派 tri-model-operator 子智能体闭环完成模块重构、单测验证与代码审查"
+  ]
+}

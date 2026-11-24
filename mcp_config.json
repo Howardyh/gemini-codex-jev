@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "bridge": {
+      "command": "node",
+      "args": [
+        "--use-env-proxy",
+        "${PLUGIN_ROOT}/server/mcp-server.mjs"
+      ],
+      "env": {
+        "NODE_USE_ENV_PROXY": "1",
+        "TRI_BRIDGE_PLUGIN_DATA": "${PLUGIN_DATA}"
+      }
+    }
+  }
+}

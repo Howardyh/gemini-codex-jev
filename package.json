@@ -1,0 +1,19 @@
+{
+  "name": "gemini-codex-jev",
+  "version": "0.1.0",
+  "description": "Antigravity plugin bridging Gemini (System 2 thinking), TypeSafe Jev (System 1 calibrated judgment gate), and OpenAI Codex CLI (sandbox execution & subagents).",
+  "type": "module",
+  "author": "Howardyh",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Howardyh/gemini-codex-jev.git"
+  },
+  "homepage": "https://github.com/Howardyh/gemini-codex-jev#readme",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "test": "node tests/offline.test.mjs"
+  }
+}
