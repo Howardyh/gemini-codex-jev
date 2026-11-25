@@ -330,11 +330,54 @@ export function interpretJevAnswers(answers, questions) {
 }
 
 /**
- * 解析当前环境中的 HTTP(S) 代理地址（尊重 NO_PROXY）。
- * @param {string} targetUrl
- * @returns {URL | null}
+ * 解析 Windows 注册表中的代理配置（HKCU\Environment 与 Internet Settings）。
+ * @returns {string}
  */
-function resolveProxyUrl(targetUrl) {
+function readWindowsRegistryProxy() {
+  if (process.platform !== 'win32') return '';
+  for (const name of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) {
+    try {
+      const out = execFileSync('reg.exe', ['query', 'HKCU\\Environment', '/v', name], {
+        encoding: 'utf8',
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const m = out.match(/^\s*(?:HTTPS_PROXY|HTTP_PROXY)\s+REG_(?:EXPAND_)?SZ\s+(.+)\s*$/im);
+      if (m?.[1]?.trim()) return m[1].trim();
+    } catch {
+      // 忽略缺失项
+    }
+  }
+  try {
+    const out = execFileSync(
+      'reg.exe',
+      ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'],
+      { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    const enabledMatch = out.match(/^\s*ProxyEnable\s+REG_DWORD\s+0x([0-9a-f]+)/im);
+    if (!enabledMatch || Number.parseInt(enabledMatch[1], 16) !== 1) return '';
+    const serverMatch = out.match(/^\s*ProxyServer\s+REG_(?:EXPAND_)?SZ\s+(.+)\s*$/im);
+    let server = serverMatch?.[1]?.trim() || '';
+    if (!server) return '';
+    if (server.includes('=')) {
+      const parts = server.split(';').map((s) => s.trim());
+      const httpsPart = parts.find((p) => /^https=/i.test(p));
+      const httpPart = parts.find((p) => /^http=/i.test(p));
+      server = (httpsPart || httpPart || parts[0] || '').replace(/^[a-z]+=/i, '');
+    }
+    if (!server) return '';
+    return /^https?:\/\//i.test(server) ? server : `http://${server}`;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 解析当前环境中的 HTTP(S) 代理地址（尊重 NO_PROXY，并支持 Windows 注册表回退）。
+ * @param {string} targetUrl
+ * @returns {{ url: URL | null, fromEnv: boolean }}
+ */
+function resolveProxyInfo(targetUrl) {
   const target = new URL(targetUrl);
   const noProxy = (process.env.NO_PROXY || process.env.no_proxy || '')
     .split(',')
@@ -342,32 +385,43 @@ function resolveProxyUrl(targetUrl) {
     .filter(Boolean);
   const hostLower = target.hostname.toLowerCase();
   if (noProxy.some((entry) => entry === '*' || hostLower === entry || hostLower.endsWith(`.${entry.replace(/^\./, '')}`))) {
-    return null;
+    return { url: null, fromEnv: false };
   }
-  const rawProxy =
+  const envProxy =
     process.env.HTTPS_PROXY ||
     process.env.https_proxy ||
     process.env.HTTP_PROXY ||
     process.env.http_proxy ||
     '';
-  if (!rawProxy.trim()) return null;
-  try {
-    return new URL(rawProxy.trim());
-  } catch {
-    return null;
+  if (envProxy.trim()) {
+    try {
+      return { url: new URL(envProxy.trim()), fromEnv: true };
+    } catch {
+      return { url: null, fromEnv: false };
+    }
   }
+  const regProxy = readWindowsRegistryProxy();
+  if (regProxy) {
+    try {
+      return { url: new URL(regProxy), fromEnv: false };
+    } catch {
+      return { url: null, fromEnv: false };
+    }
+  }
+  return { url: null, fromEnv: false };
 }
 
 /**
- * 在未开启 NODE_USE_ENV_PROXY 时通过纯 Node HTTP CONNECT 隧道兼容系统代理，
- * 避免独立 Node 进程直连遭遇区域 451 错误。
+ * 在未开启 NODE_USE_ENV_PROXY 或环境变量未继承时通过纯 Node HTTP CONNECT 隧道兼容系统代理，
+ * 避免独立/GUI 子进程直连遭遇区域 451 错误。
  */
 async function postJsonOrForm(url, headers, body, timeoutMs) {
   const envProxyEnabled =
     process.env.NODE_USE_ENV_PROXY === '1' || process.execArgv.includes('--use-env-proxy');
-  const proxyUrl = !envProxyEnabled ? resolveProxyUrl(url) : null;
+  const { url: proxyUrl, fromEnv } = resolveProxyInfo(url);
 
-  if (!proxyUrl || !/^https?:$/i.test(proxyUrl.protocol)) {
+  // 仅当未配置代理，或代理来自环境变量且已开启 NODE_USE_ENV_PROXY 时直接走原生 fetch
+  if (!proxyUrl || (fromEnv && envProxyEnabled) || !/^https?:$/i.test(proxyUrl.protocol)) {
     const response = await fetch(url, {
       method: 'POST',
       headers,

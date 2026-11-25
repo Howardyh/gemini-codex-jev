@@ -4,9 +4,11 @@
  * 暴露 5 个紧凑工具：jev_judge / codex_exec / codex_continue / codex_review / bridge_status。
  */
 
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { getCodexQuotaSnapshot } from './codex-quota.mjs';
 import {
   cancelAllRuns,
   cancelRun,
@@ -22,6 +24,7 @@ import {
 import { callJev, getTypeSafeKeyStatus } from './jev-client.mjs';
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
+const CAPSULE_DAEMON_PATH = join(SERVER_DIR, 'capsule-daemon.mjs');
 const PLUGIN_MANIFEST_PATH = join(dirname(SERVER_DIR), 'plugin.json');
 
 const SUPPORTED_MCP_VERSIONS = new Set([
@@ -267,13 +270,13 @@ export const TOOLS = [
   {
     name: 'bridge_status',
     description:
-      'Inspect local Codex binary/model readiness and TypeSafe Jev key status (doctor), list active Codex processes (active), or kill a stuck run (cancel).',
+      'Inspect local Codex binary/model readiness and TypeSafe Jev key status (doctor), fetch live Codex remaining quota (quota), list active Codex processes (active), or kill a stuck run (cancel).',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['doctor', 'active', 'cancel'],
+          enum: ['doctor', 'quota', 'active', 'cancel'],
           description: 'Diagnostic or control action (default: doctor).',
         },
         run_id: {
@@ -306,10 +309,14 @@ async function executeTool(name, args = {}) {
         }
         return cancelRun(args.run_id);
       }
+      if (action === 'quota') {
+        return await getCodexQuotaSnapshot({ forceLive: true });
+      }
       const binary = discoverCodexBinary();
       const cache = loadSupportedCodexModels();
       const defaultPick = resolveCodexModel(null);
       const jevKey = getTypeSafeKeyStatus();
+      const codexQuota = await getCodexQuotaSnapshot({ forceLive: false });
       return {
         ok: binary.found,
         codex: {
@@ -321,6 +328,7 @@ async function executeTool(name, args = {}) {
           git_bin_dir: discoverGitBinDir(),
           default_model: defaultPick.model,
           supported_models: cache.models,
+          quota: codexQuota,
         },
         jev: {
           endpoint: 'https://api.typesafe.ai/v1/systemone',
@@ -435,6 +443,39 @@ function startStdioServer() {
   let rawBuffer = Buffer.alloc(0);
   let activeRequests = 0;
   let stdinClosed = false;
+  let capsuleChild = null;
+
+  if (process.env.TRI_BRIDGE_DISABLE_CAPSULE !== '1' && existsSync(CAPSULE_DAEMON_PATH)) {
+    try {
+      capsuleChild = spawn(process.execPath, [CAPSULE_DAEMON_PATH], {
+        cwd: SERVER_DIR,
+        windowsHide: true,
+        stdio: ['pipe', 'ignore', 'ignore'],
+      });
+      capsuleChild.on('error', () => {});
+      capsuleChild.on('exit', () => {
+        capsuleChild = null;
+      });
+    } catch {
+      capsuleChild = null;
+    }
+  }
+
+  function disposeCapsuleDaemon() {
+    if (!capsuleChild) return;
+    const child = capsuleChild;
+    capsuleChild = null;
+    try {
+      child.stdin?.write('SHUTDOWN_DISPOSE\n');
+      child.stdin?.end();
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        // 忽略强杀异常
+      }
+    }
+  }
 
   function writeJsonRpcResponse(payload, mode) {
     const serialized = JSON.stringify(payload);
@@ -452,6 +493,7 @@ function startStdioServer() {
     if (stdinClosed && activeRequests === 0 && !exiting) {
       exiting = true;
       cancelAllRuns();
+      disposeCapsuleDaemon();
       setImmediate(() => process.exit(0));
     }
   }
@@ -552,11 +594,13 @@ function startStdioServer() {
 
   process.on('SIGINT', () => {
     cancelAllRuns();
+    disposeCapsuleDaemon();
     process.exit(0);
   });
 
   process.on('SIGTERM', () => {
     cancelAllRuns();
+    disposeCapsuleDaemon();
     process.exit(0);
   });
 }

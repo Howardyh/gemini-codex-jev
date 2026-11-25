@@ -25,6 +25,7 @@ flowchart LR
 - **TypeSafe Jev (System 1) 门控**：内置 `task_route`（任务分流）与 `patch_gate`（补丁质量门禁）模板，支持自定义 `choice` / `noul` / `score` / `box` 与静态 PNG（`280..1568` 像素）多部分提交；自带规范化 SHA-256 缓存、单任务预算锁与 HTTP `CONNECT` 代理隧道兼容。
 - **Codex CLI 全生命周期掌控**：自动定位本机完整版 Codex 可执行文件（Windows 支持扫描 `WindowsApps` 与 GitHub Desktop 内置 Git，macOS/Linux 支持 `PATH` 发现），自动读取 `models_cache.json` 选择可用模型，避免 `stdin` 管道阻塞与子命令参数冲突。
 - **独立隔离执行子智能体**：内置 `tri-model-operator` 子智能体，将多轮单测与修复日志隔离在子会话中，仅向主会话返回精炼验收摘要。
+- **Antigravity 顶栏 Codex 额度胶囊**：插件启用后自动在 Antigravity 顶栏实时渲染 **Codex 5 小时窗口与 7 天周窗口剩余额度**（点击/悬停展开详情面板、重置倒计时与可用重置券数，支持一键手动刷新）。
 
 ## 环境要求
 
@@ -59,7 +60,7 @@ flowchart LR
 | `codex_exec` | 启动非交互式 Codex 执行任务，支持沙盒策略、推理强度、`enable_subagents`（`multi_agent_v2`）与 `--worktree`。 |
 | `codex_continue` | 基于 `thread_id` 执行 `resume`（原上下文续接修复）、`fork`（分支探索）或 `queue`（队列消息投递）。 |
 | `codex_review` | 运行 `codex exec review` 对未提交变更、`base` 分支、`commit` 或自定义聚焦提示进行独立审查（非 Git 目录自动降级）。 |
-| `bridge_status` | 执行 `doctor` 诊断（Codex 路径、可用模型、Git 路径、密钥存在状态）、`active` 查看运行中进程、`cancel` 终止卡死任务。 |
+| `bridge_status` | 执行 `doctor` 诊断（Codex 路径、可用模型、Git 路径、密钥与额度快照）、`quota` 实时拉取 Codex 5h/7d 剩余额度、`active` 查看运行中进程、`cancel` 终止卡死任务。 |
 
 ## 离线测试
 

@@ -10,8 +10,11 @@ const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = resolve(TESTS_DIR, '..');
 const MCP_SERVER_PATH = join(PLUGIN_ROOT, 'server', 'mcp-server.mjs');
 const JEV_CLIENT_URL = pathToFileURL(join(PLUGIN_ROOT, 'server', 'jev-client.mjs')).href;
+const CODEX_QUOTA_URL = pathToFileURL(join(PLUGIN_ROOT, 'server', 'codex-quota.mjs')).href;
 
 const { interpretJevAnswers } = await import(JEV_CLIENT_URL);
+const { formatResetDuration, normalizeAppServerRateLimits, normalizeRolloutRateLimits } =
+  await import(CODEX_QUOTA_URL);
 
 function crc32(buf) {
   let c = 0xffffffff;
@@ -58,6 +61,7 @@ class McpTestClient {
     this.child = spawn(process.execPath, [MCP_SERVER_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      env: { ...process.env, TRI_BRIDGE_DISABLE_CAPSULE: '1' },
     });
     this.buffer = Buffer.alloc(0);
     this.pending = new Map();
@@ -274,6 +278,39 @@ async function main() {
     assert.equal(gates.ambiguous_check.verdict, 'uncertain_escalate');
     assert.equal(gates.execution_route.top_option, 'codex_single');
     console.log('[PASS] interpretJevAnswers payload checks');
+
+    const nowMs = 1_795_542_687_000;
+    const liveQuota = normalizeAppServerRateLimits(
+      {
+        ordinaryUsageAllowed: true,
+        rateLimits: {
+          primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 1795554795 },
+          secondary: { usedPercent: 26, windowDurationMins: 10080, resetsAt: 1795869609 },
+          planType: 'plus',
+        },
+        rateLimitResetCredits: { availableCount: 3 },
+      },
+      nowMs,
+    );
+    assert.equal(liveQuota.ok, true);
+    assert.equal(liveQuota.primary_5h.remaining_pct, 90);
+    assert.equal(liveQuota.secondary_weekly.remaining_pct, 74);
+    assert.equal(liveQuota.reset_credits_count, 3);
+    assert.equal(liveQuota.plan_type, 'plus');
+
+    const rolloutQuota = normalizeRolloutRateLimits(
+      {
+        primary: { used_percent: 12.5, window_minutes: 300, resets_at: 1795554795 },
+        secondary: { used_percent: 30, window_minutes: 10080, resets_at: 1795869609 },
+        plan_type: 'plus',
+      },
+      nowMs,
+    );
+    assert.equal(rolloutQuota.primary_5h.remaining_pct, 87.5);
+    assert.equal(rolloutQuota.secondary_weekly.remaining_pct, 70);
+    assert.equal(formatResetDuration(1795554795, nowMs), '3h 22m');
+    assert.equal(formatResetDuration(1795869609, nowMs), '3d 18h');
+    console.log('[PASS] codex-quota normalization & reset formatting checks');
 
     await runModeChecks('line', validPng, smallPng);
     console.log('[PASS] line-delimited JSON framing checks');
