@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { deflateSync } from 'node:zlib';
@@ -15,6 +14,71 @@ const CODEX_QUOTA_URL = pathToFileURL(join(PLUGIN_ROOT, 'server', 'codex-quota.m
 const { interpretJevAnswers } = await import(JEV_CLIENT_URL);
 const { formatResetDuration, normalizeAppServerRateLimits, normalizeRolloutRateLimits } =
   await import(CODEX_QUOTA_URL);
+const { classifyQuotaTone, buildClientPayload, buildInjectedClientScript, resolveDevToolsPortCandidates } =
+  await import('../server/capsule-daemon.mjs');
+
+function runCapsuleChecks() {
+  for (const [value, tone] of [
+    [100, 'good'], [50, 'good'], [49, 'warn'], [20, 'warn'], [19, 'danger'], [0, 'danger'],
+    [null, 'neutral'], [NaN, 'neutral'], [undefined, 'neutral'], ['50', 'neutral'],
+  ]) assert.equal(classifyQuotaTone(value), tone);
+
+  const nowMs = new Date(2030, 0, 2, 3, 4, 5).getTime();
+  const quota = {
+    ok: true, source: 'app_server_live', plan_type: 'plus', reset_credits_count: 3,
+    primary_5h: { remaining_pct: 90, used_pct: 10, resets_at_sec: nowMs / 1000 + 18000 },
+    secondary_weekly: { remaining_pct: 19, used_pct: 81, resets_at_sec: nowMs / 1000 + 7 * 86400 },
+  };
+  const payload = buildClientPayload(quota, { present: true }, nowMs);
+  assert.deepEqual(payload, {
+    quota, p5_reset_text: '5h 0m', p7_reset_text: '7d 0h', jev_ready: true, updated_label: '03:04:05',
+  });
+  assert.equal(payload.quota, quota);
+  assert.deepEqual(buildClientPayload(null, null, nowMs), {
+    quota: null, p5_reset_text: '--', p7_reset_text: '--', jev_ready: false, updated_label: '03:04:05',
+  });
+  assert.equal(buildClientPayload({ primary_5h: { resets_at_sec: nowMs / 1000 - 1 } }, {}, nowMs).p5_reset_text, '即将重置');
+  assert.equal(buildClientPayload({ primary_5h: { resets_at_sec: nowMs / 1000 + 1 } }, {}, nowMs).p5_reset_text, '1m');
+
+  const script = buildInjectedClientScript('0.3.0', payload);
+  assert.doesNotThrow(() => new Function(script));
+  assert.doesNotThrow(() => new Function(buildInjectedClientScript('0.3.0', null)));
+  for (const marker of [
+    'wm-capsule-btn', 'wm-cap-slot', 'wm-sep', 'wm-popover-in', 'anim-modern-pop-in',
+    'is-instant', 'wm-spin-icon', 'ag-usage-monitor-portal', 'contextmenu', 'quota-pool-row',
+    'data-color-scheme', 'data-modern-ui', 'data-font-scale', 'data-layout', 'syncHostAppearance',
+    'wm-popover-in-up', 'anim-modern-pop-in-up', 'wm-pin-badge', 'forceRefreshPending',
+    "removeEventListener('resize'", "removeEventListener('click'", "removeEventListener('keydown'",
+  ]) assert.ok(script.includes(marker), `注入脚本缺少 ${marker}`);
+  assert.ok(script.includes("if (!wasVisible && visible) cardEl.classList.remove('is-instant')"));
+  assert.ok(script.includes('}, 40)'));
+  assert.ok(script.includes('r="5.25" stroke-width="2"'));
+
+  // 使用通用模式检查，不把本机身份写入测试夹具。
+  const piiPatterns = [
+    /[a-z]:[\\/]+users[\\/]+[^\\/\s"'<>]+/i,
+    /\/(?:home|Users)\/[^/\s"'<>]+/,
+    /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i,
+    /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i,
+    /\bsk-(?:proj-)?[a-z0-9_-]{16,}\b/i,
+    /\b(?:Bearer\s+)[a-z0-9._-]{16,}\b/i,
+    /\b[a-z0-9.]+_\d+\.\d+\.\d+\.\d+_(?:x64|arm64|x86)__[a-z0-9]+\b/i,
+  ];
+  for (const pattern of piiPatterns) assert.doesNotMatch(script, pattern);
+  for (const name of ['server/capsule-daemon.mjs', 'tests/offline.test.mjs', 'README.md', 'package.json', 'plugin.json']) {
+    const content = readFileSync(join(PLUGIN_ROOT, name), 'utf8');
+    for (const pattern of piiPatterns) assert.doesNotMatch(content, pattern, `${name} 包含身份信息`);
+  }
+  assert.equal(JSON.parse(readFileSync(join(PLUGIN_ROOT, 'plugin.json'), 'utf8')).version, '0.3.0');
+  assert.equal(JSON.parse(readFileSync(join(PLUGIN_ROOT, 'package.json'), 'utf8')).version, '0.3.0');
+
+  // 合成路径覆盖跨平台发现，不读取本机 DevTools 文件。
+  assert.deepEqual(resolveDevToolsPortCandidates({ ANTIGRAVITY_DEVTOOLS_PORT_FILE: 'custom-port-file' }, 'linux', '/virtual'), ['custom-port-file']);
+  assert.ok(resolveDevToolsPortCandidates({}, 'win32', '/virtual').some((file) => file.endsWith(join('AppData', 'Roaming', 'Antigravity', 'DevToolsActivePort'))));
+  assert.ok(resolveDevToolsPortCandidates({}, 'darwin', '/virtual').includes(join('/virtual', 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort')));
+  assert.ok(resolveDevToolsPortCandidates({ XDG_CONFIG_HOME: '/config' }, 'linux', '/virtual').includes(join('/config', 'Antigravity', 'DevToolsActivePort')));
+  console.log('[PASS] capsule tone, payload, script syntax, theme/motion structure & zero-PII checks');
+}
 
 function crc32(buf) {
   let c = 0xffffffff;
@@ -245,7 +309,8 @@ async function runModeChecks(mode, validPng, smallPng) {
 }
 
 async function main() {
-  const tempDir = mkdtempSync(join(tmpdir(), 'gemini-codex-jev-offline-'));
+  runCapsuleChecks();
+  const tempDir = mkdtempSync(join(PLUGIN_ROOT, '.offline-'));
   const validPng = join(tempDir, 'valid-300.png');
   const smallPng = join(tempDir, 'small-100.png');
   writeFileSync(validPng, createSolidPng(300, 300));
@@ -318,6 +383,7 @@ async function main() {
     console.log('[PASS] LSP Content-Length framing checks');
     console.log('ALL OFFLINE CHECKS PASSED (0 network calls, 0 API spend)');
   } finally {
+    assert.equal(dirname(tempDir), PLUGIN_ROOT);
     rmSync(tempDir, { recursive: true, force: true });
   }
 }

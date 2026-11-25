@@ -1,7 +1,7 @@
 {
   "name": "gemini-codex-jev",
   "displayName": "Gemini × Jev × Codex 三模型协同编排套件",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "连接 Gemini 深度思考、TypeSafe Jev 毫秒级校准判别门控与本地 OpenAI Codex 沙盒执行/子智能体引擎，并在 Antigravity 顶栏实时展示 Codex 剩余额度胶囊。",
   "author": "Howardyh",
   "homepage": "https://github.com/Howardyh/gemini-codex-jev",

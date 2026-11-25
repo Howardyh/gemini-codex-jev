@@ -25,7 +25,7 @@ flowchart LR
 - **TypeSafe Jev (System 1) 门控**：内置 `task_route`（任务分流）与 `patch_gate`（补丁质量门禁）模板，支持自定义 `choice` / `noul` / `score` / `box` 与静态 PNG（`280..1568` 像素）多部分提交；自带规范化 SHA-256 缓存、单任务预算锁与 HTTP `CONNECT` 代理隧道兼容。
 - **Codex CLI 全生命周期掌控**：自动定位本机完整版 Codex 可执行文件（Windows 支持扫描 `WindowsApps` 与 GitHub Desktop 内置 Git，macOS/Linux 支持 `PATH` 发现），自动读取 `models_cache.json` 选择可用模型，避免 `stdin` 管道阻塞与子命令参数冲突。
 - **独立隔离执行子智能体**：内置 `tri-model-operator` 子智能体，将多轮单测与修复日志隔离在子会话中，仅向主会话返回精炼验收摘要。
-- **Antigravity 顶栏 Codex 额度胶囊**：插件启用后自动在 Antigravity 顶栏实时渲染 **Codex 5 小时窗口与 7 天周窗口剩余额度**（点击/悬停展开详情面板、重置倒计时与可用重置券数，支持一键手动刷新）。
+- **Antigravity 顶栏 Codex 额度胶囊（v0.3.0）**：按 `usage-monitor v1.5.5` 规格对齐 CSS tokens、双环胶囊、浮层几何与 keyframes；自动同步浅色/深色、Modern UI、字体缩放及顶栏布局。悬停即开，点击固定，轮询更新不重播入场动画；右键静默刷新，图标旋转反馈，支持 `Escape` 关闭。
 
 ## 环境要求
 
@@ -64,7 +64,7 @@ flowchart LR
 
 ## 离线测试
 
-运行内置离线测试套件（包含 MCP 双帧协议握手、SHA-256 规范化、`dry_run` 预览与 PNG 校验，零网络请求与 API 费用）：
+运行内置离线测试套件（包含 MCP 双帧协议握手、SHA-256 规范化、`dry_run` 预览、PNG 校验、额度分级与倒计时、注入脚本语法/结构及 PII 检查，零网络请求与 API 费用）：
 
 ```bash
 npm test
