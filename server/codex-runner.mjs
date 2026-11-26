@@ -7,8 +7,9 @@
  * 4. 封装 exec / resume / fork / queue / review 与活跃进程管控。
  */
 
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { resolveSubprocessProxyEnv } from './jev-client.mjs';
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
@@ -23,36 +24,75 @@ const FALLBACK_SANDBOX_BIN = join(CODEX_HOME, '.sandbox-bin', CODEX_EXE_NAME);
 const PREFERRED_DEFAULT_MODELS = ['gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-6-astra'];
 
 const activeRuns = new Map();
+let cachedWindowsAppsCodex = { checkedAtMs: 0, path: null };
 
 /**
  * 探测 WindowsApps 中最新版本 OpenAI.Codex_* 的 app\resources\codex.exe。
+ * WindowsApps 根目录默认禁止非特权列表枚举，因此先查 HKCU AppModel 注册表获知准确包名后再直接访问子路径。
  * @returns {string | null}
  */
 function scanWindowsAppsCodex() {
   if (process.platform !== 'win32') return null;
+  if (
+    cachedWindowsAppsCodex.path &&
+    Date.now() - cachedWindowsAppsCodex.checkedAtMs < 60_000 &&
+    existsSync(cachedWindowsAppsCodex.path)
+  ) {
+    return cachedWindowsAppsCodex.path;
+  }
+
   const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
   const windowsAppsDir = join(programFiles, 'WindowsApps');
+  const packageNames = new Set();
+
   try {
-    if (!existsSync(windowsAppsDir)) return null;
-    const entries = readdirSync(windowsAppsDir)
-      .filter((name) => /^OpenAI\.Codex_/i.test(name))
-      .map((name) => {
-        const exePath = join(windowsAppsDir, name, 'app', 'resources', 'codex.exe');
-        if (!existsSync(exePath)) return null;
-        let mtimeMs = 0;
-        try {
-          mtimeMs = statSync(exePath).mtimeMs;
-        } catch {
-          // 忽略 stat 异常
-        }
-        return { name, exePath, mtimeMs };
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
-    return entries[0]?.exePath || null;
+    const stdout = execFileSync(
+      'reg.exe',
+      [
+        'query',
+        'HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages',
+        '/f',
+        'OpenAI.Codex_',
+        '/k',
+      ],
+      { encoding: 'utf8', windowsHide: true, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    for (const line of stdout.split(/\r?\n/)) {
+      const m = line.trim().match(/\\(OpenAI\.Codex_[^\\\s]+)$/i);
+      if (m?.[1]) packageNames.add(m[1]);
+    }
   } catch {
-    return null;
+    // 忽略注册表检索异常
   }
+
+  try {
+    if (existsSync(windowsAppsDir)) {
+      for (const name of readdirSync(windowsAppsDir)) {
+        if (/^OpenAI\.Codex_/i.test(name)) packageNames.add(name);
+      }
+    }
+  } catch {
+    // WindowsApps 目录受 ACL 保护时静默回退到注册表结果
+  }
+
+  const entries = Array.from(packageNames)
+    .map((name) => {
+      const exePath = join(windowsAppsDir, name, 'app', 'resources', 'codex.exe');
+      if (!existsSync(exePath)) return null;
+      let mtimeMs = 0;
+      try {
+        mtimeMs = statSync(exePath).mtimeMs;
+      } catch {
+        // 忽略 stat 异常
+      }
+      return { name, exePath, mtimeMs };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
+
+  const picked = entries[0]?.exePath || null;
+  cachedWindowsAppsCodex = { checkedAtMs: Date.now(), path: picked };
+  return picked;
 }
 
 /**
@@ -463,6 +503,7 @@ function spawnCodexProcess({
   }
 
   const childEnv = { ...process.env };
+  Object.assign(childEnv, resolveSubprocessProxyEnv(childEnv));
   const gitBinDir = discoverGitBinDir();
   const extraDirs = [binary.binDir, gitBinDir].filter(Boolean);
   if (extraDirs.length > 0) {

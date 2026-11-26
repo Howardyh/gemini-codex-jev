@@ -26,6 +26,15 @@ import { callJev, getTypeSafeKeyStatus } from './jev-client.mjs';
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const CAPSULE_DAEMON_PATH = join(SERVER_DIR, 'capsule-daemon.mjs');
 const PLUGIN_MANIFEST_PATH = join(dirname(SERVER_DIR), 'plugin.json');
+let capsuleChild = null;
+
+function notifyCapsuleForceRefresh() {
+  try {
+    if (capsuleChild?.stdin?.writable) capsuleChild.stdin.write('FORCE_REFRESH\n');
+  } catch {
+    // The supervisor will replace a disconnected daemon.
+  }
+}
 
 const SUPPORTED_MCP_VERSIONS = new Set([
   '2025-11-25',
@@ -293,11 +302,15 @@ async function executeTool(name, args = {}) {
     case 'jev_judge':
       return await callJev(args);
     case 'codex_exec':
-      return await runCodexExec(args);
     case 'codex_continue':
-      return await runCodexContinue(args);
     case 'codex_review':
-      return await runCodexReview(args);
+      try {
+        if (name === 'codex_exec') return await runCodexExec(args);
+        if (name === 'codex_continue') return await runCodexContinue(args);
+        return await runCodexReview(args);
+      } finally {
+        notifyCapsuleForceRefresh();
+      }
     case 'bridge_status': {
       const action = args?.action || 'doctor';
       if (action === 'active') {
@@ -443,25 +456,43 @@ function startStdioServer() {
   let rawBuffer = Buffer.alloc(0);
   let activeRequests = 0;
   let stdinClosed = false;
-  let capsuleChild = null;
+  let shuttingDown = false;
+  let respawnTimer = null;
+  let rapidCrashCount = 0;
 
-  if (process.env.TRI_BRIDGE_DISABLE_CAPSULE !== '1' && existsSync(CAPSULE_DAEMON_PATH)) {
+  function spawnCapsuleDaemon() {
+    if (shuttingDown || process.env.TRI_BRIDGE_DISABLE_CAPSULE === '1' || !existsSync(CAPSULE_DAEMON_PATH)) return;
+    const startedMs = Date.now();
+    let finished = false;
+    const onFinish = (code) => {
+      if (finished) return;
+      finished = true;
+      capsuleChild = null;
+      if (shuttingDown) return;
+      const stable = code === 0 || Date.now() - startedMs >= 10_000;
+      rapidCrashCount = stable ? 0 : rapidCrashCount + 1;
+      const delay = stable ? 1500 : Math.min(15_000, 1000 * 2 ** Math.min(rapidCrashCount - 1, 4));
+      respawnTimer = setTimeout(spawnCapsuleDaemon, delay);
+      respawnTimer.unref?.();
+    };
     try {
       capsuleChild = spawn(process.execPath, [CAPSULE_DAEMON_PATH], {
         cwd: SERVER_DIR,
         windowsHide: true,
         stdio: ['pipe', 'ignore', 'ignore'],
       });
-      capsuleChild.on('error', () => {});
-      capsuleChild.on('exit', () => {
-        capsuleChild = null;
-      });
+      capsuleChild.stdin?.on('error', () => {});
+      capsuleChild.on('error', () => onFinish(null));
+      capsuleChild.on('exit', onFinish);
     } catch {
-      capsuleChild = null;
+      onFinish(null);
     }
   }
+  spawnCapsuleDaemon();
 
   function disposeCapsuleDaemon() {
+    shuttingDown = true;
+    clearTimeout(respawnTimer);
     if (!capsuleChild) return;
     const child = capsuleChild;
     capsuleChild = null;

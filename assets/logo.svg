@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" fill="none">
+  <defs>
+    <linearGradient id="tri-a" x1="20" y1="20" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2563EB"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#10B981"/>
+    </linearGradient>
+    <linearGradient id="tri-b" x1="64" y1="22" x2="64" y2="106" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3B82F6" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#10B981" stop-opacity="0.12"/>
+    </linearGradient>
+  </defs>
+  <polygon points="64,26 100,92 28,92" fill="url(#tri-b)" stroke="url(#tri-a)" stroke-width="6.5" stroke-linejoin="round"/>
+  <line x1="64" y1="26" x2="64" y2="68" stroke="url(#tri-a)" stroke-width="5" stroke-linecap="round"/>
+  <line x1="28" y1="92" x2="64" y2="68" stroke="url(#tri-a)" stroke-width="5" stroke-linecap="round"/>
+  <line x1="100" y1="92" x2="64" y2="68" stroke="url(#tri-a)" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="64" cy="26" r="10.5" fill="#2563EB" stroke="#FFFFFF" stroke-width="3"/>
+  <circle cx="28" cy="92" r="10.5" fill="#06B6D4" stroke="#FFFFFF" stroke-width="3"/>
+  <circle cx="100" cy="92" r="10.5" fill="#10B981" stroke="#FFFFFF" stroke-width="3"/>
+  <circle cx="64" cy="68" r="8" fill="#0F172A" stroke="#E2E8F0" stroke-width="2.5"/>
+</svg>

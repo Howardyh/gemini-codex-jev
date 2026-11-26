@@ -25,7 +25,8 @@ flowchart LR
 - **TypeSafe Jev (System 1) 门控**：内置 `task_route`（任务分流）与 `patch_gate`（补丁质量门禁）模板，支持自定义 `choice` / `noul` / `score` / `box` 与静态 PNG（`280..1568` 像素）多部分提交；自带规范化 SHA-256 缓存、单任务预算锁与 HTTP `CONNECT` 代理隧道兼容。
 - **Codex CLI 全生命周期掌控**：自动定位本机完整版 Codex 可执行文件（Windows 支持扫描 `WindowsApps` 与 GitHub Desktop 内置 Git，macOS/Linux 支持 `PATH` 发现），自动读取 `models_cache.json` 选择可用模型，避免 `stdin` 管道阻塞与子命令参数冲突。
 - **独立隔离执行子智能体**：内置 `tri-model-operator` 子智能体，将多轮单测与修复日志隔离在子会话中，仅向主会话返回精炼验收摘要。
-- **Antigravity 顶栏 Codex 额度胶囊（v0.3.0）**：按 `usage-monitor v1.5.5` 规格对齐 CSS tokens、双环胶囊、浮层几何与 keyframes；自动同步浅色/深色、Modern UI、字体缩放及顶栏布局。悬停即开，点击固定，轮询更新不重播入场动画；右键静默刷新，图标旋转反馈，支持 `Escape` 关闭。
+- **专属 `/tri` 斜杠协同入口（v0.4.0）**：在聊天框输入 `/tri <任务>` 即可获得与 `/plan` 同等的两阶段协同体验——先完成只读调研、TypeSafe Jev `task_route` 路由与方案卡片生成，点击 Proceed 确认后自动执行 Codex 沙盒编码与 Jev/Codex 双重门禁验收。
+- **Antigravity 顶栏 Codex 额度胶囊（v0.4.0）**：按 `usage-monitor v1.5.5` 规格对齐 CSS tokens、双环胶囊、浮层几何与 keyframes；自动同步浅色/深色、Modern UI、字体缩放及顶栏布局。具备冷启动 `<100ms` 秒级首屏挂载、脱敏快照缓存、心跳式热备租约接管、多会话回溯扫描、跨重置时间点自动归零、以及基于递增序号的展开自动保鲜/右键强刷。
 
 ## 环境要求
 
@@ -47,9 +48,10 @@ flowchart LR
   ```
 
 安装后开启新会话即可在 Antigravity 中直接调用以下组件：
+- **斜杠命令**：`/tri`（三模型协同两阶段规划与执行入口）
 - **MCP 工具**：`jev_judge`、`codex_exec`、`codex_continue`、`codex_review`、`bridge_status`
 - **子智能体**：`tri-model-operator`
-- **技能**：`tri-model-synergy`
+- **技能**：`tri`、`tri-model-synergy`
 - **协同准则**：`rules/AGENTS.md`
 
 ## 暴露的 MCP 工具 (`bridge`)

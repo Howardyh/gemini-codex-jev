@@ -6,17 +6,21 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, openSync, closeSync, readdirSync, readSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync, openSync, closeSync, readdirSync, readSync, statSync, mkdirSync, renameSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { discoverCodexBinary, discoverGitBinDir } from './codex-runner.mjs';
+import { resolveSubprocessProxyEnv } from './jev-client.mjs';
 
 const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), '.codex');
 const SESSIONS_ROOT = join(CODEX_HOME, 'sessions');
-const LIVE_CACHE_TTL_MS = 180_000;
+const LIVE_CACHE_TTL_MS = 90_000;
 const TAIL_READ_BYTES = 131_072;
 
 let cachedSnapshot = null;
+let lastLiveAttemptMs = 0;
+let liveFailCount = 0;
 
 function clampPct(val) {
   const num = Number(val);
@@ -115,105 +119,168 @@ export function normalizeRolloutRateLimits(rateLimits, observedAtMs = Date.now()
   };
 }
 
-/**
- * 查找 ~/.codex/sessions 下最新修改的 .jsonl 会话文件（只检查最近年份/月份/日期目录）。
- * @param {string} [sessionsRoot=SESSIONS_ROOT]
- * @returns {{ path: string, mtimeMs: number } | null}
- */
-function findLatestRolloutFile(sessionsRoot = SESSIONS_ROOT) {
-  if (!existsSync(sessionsRoot)) return null;
-  try {
-    const years = readdirSync(sessionsRoot)
-      .filter((n) => /^\d{4}$/.test(n))
-      .sort((a, b) => b.localeCompare(a));
-    for (const y of years) {
-      const yDir = join(sessionsRoot, y);
-      const months = readdirSync(yDir)
-        .filter((n) => /^\d{2}$/.test(n))
-        .sort((a, b) => b.localeCompare(a));
-      for (const m of months) {
-        const mDir = join(yDir, m);
-        const days = readdirSync(mDir)
-          .filter((n) => /^\d{2}$/.test(n))
-          .sort((a, b) => b.localeCompare(a));
-        for (const d of days) {
-          const dDir = join(mDir, d);
-          const files = readdirSync(dDir)
-            .filter((n) => n.endsWith('.jsonl'))
-            .map((n) => {
-              const p = join(dDir, n);
-              try {
-                return { path: p, mtimeMs: statSync(p).mtimeMs };
-              } catch {
-                return null;
-              }
-            })
-            .filter(Boolean)
-            .sort((a, b) => b.mtimeMs - a.mtimeMs);
-          if (files.length > 0) return files[0];
-        }
+/** Collect recent files across descending session dates. */
+export function findRecentRolloutFiles(sessionsRoot = SESSIONS_ROOT, limit = 8) {
+  const files = [];
+  const count = Math.max(0, Math.trunc(Number(limit) || 0));
+  if (!count) return files;
+  const directories = (root, pattern) => {
+    try {
+      return readdirSync(root, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && pattern.test(entry.name))
+        .map((entry) => entry.name).sort((a, b) => b.localeCompare(a));
+    } catch { return []; }
+  };
+  for (const year of directories(sessionsRoot, /^\d{4}$/)) {
+    const yearDir = join(sessionsRoot, year);
+    for (const month of directories(yearDir, /^\d{2}$/)) {
+      const monthDir = join(yearDir, month);
+      for (const day of directories(monthDir, /^\d{2}$/)) {
+        const dayDir = join(monthDir, day);
+        try {
+          for (const entry of readdirSync(dayDir, { withFileTypes: true })) {
+            if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+            const path = join(dayDir, entry.name);
+            try { files.push({ path, mtimeMs: statSync(path).mtimeMs }); } catch {}
+          }
+        } catch {}
+        if (files.length >= count) return files.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, count);
       }
     }
-  } catch {
-    // 忽略扫描异常
   }
-  return null;
+  return files.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, count);
 }
-
 /**
  * 读取最新 Codex rollout 会话尾部中的 rate_limits 记录（零子进程开销）。
  * @param {string} [sessionsRoot=SESSIONS_ROOT]
  */
-export function readLatestRolloutRateLimits(sessionsRoot = SESSIONS_ROOT) {
-  const latest = findLatestRolloutFile(sessionsRoot);
-  if (!latest) return null;
+export function readLatestRolloutRateLimits(sessionsRoot = SESSIONS_ROOT, nowMs = Date.now()) {
+  for (const latest of findRecentRolloutFiles(sessionsRoot, 8)) {
 
-  let fd;
-  try {
-    const stat = statSync(latest.path);
-    const size = stat.size;
-    if (size <= 0) return null;
-    const readLen = Math.min(size, TAIL_READ_BYTES);
-    const startOffset = size - readLen;
-    const buf = Buffer.allocUnsafe(readLen);
-    fd = openSync(latest.path, 'r');
-    const bytesRead = readSync(fd, buf, 0, readLen, startOffset);
-    const text = buf.subarray(0, bytesRead).toString('utf8');
-    const lines = text.split(/\r?\n/);
+    let fd;
+    try {
+      const stat = statSync(latest.path);
+      const size = stat.size;
+      if (size <= 0) continue;
+      const readLen = Math.min(size, TAIL_READ_BYTES);
+      const startOffset = size - readLen;
+      const buf = Buffer.allocUnsafe(readLen);
+      fd = openSync(latest.path, 'r');
+      const bytesRead = readSync(fd, buf, 0, readLen, startOffset);
+      const text = buf.subarray(0, bytesRead).toString('utf8');
+      const lines = text.split(/\r?\n/);
 
-    for (let i = lines.length - 1; i >= 0; i -= 1) {
-      const line = lines[i].trim();
-      if (!line || !line.includes('"rate_limits"')) continue;
-      try {
-        const obj = JSON.parse(line);
-        const rl = obj?.payload?.rate_limits || obj?.rate_limits;
-        if (rl) {
-          const normalized = normalizeRolloutRateLimits(rl, latest.mtimeMs);
-          if (normalized) return normalized;
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = lines[i].trim();
+        if (!line || !line.includes('"rate_limits"')) continue;
+        try {
+          const obj = JSON.parse(line);
+          const rl = obj?.payload?.rate_limits || obj?.rate_limits;
+          if (rl) {
+            const normalized = normalizeRolloutRateLimits(rl, latest.mtimeMs);
+            if (normalized) return reconcileExpiredWindows(normalized, nowMs);
+          }
+        } catch {
+          // 忽略截断首行或损坏 JSON
         }
-      } catch {
-        // 忽略截断首行或损坏 JSON
       }
-    }
-  } catch {
-    return null;
-  } finally {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd);
-      } catch {
-        // 忽略关闭异常
+    } catch {
+      // Try another recent file.
+    } finally {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          // 忽略关闭异常
+        }
       }
     }
   }
   return null;
+}
+
+export function reconcileExpiredWindows(snapshot, nowMs = Date.now()) {
+  if (!snapshot || !snapshot.ok) return snapshot;
+  let needsRefresh = false;
+  const reconcile = (win) => {
+    if (win && win.resets_at_sec > 0 && nowMs >= win.resets_at_sec * 1000) {
+      needsRefresh = true;
+      return { ...win, used_pct: 0, remaining_pct: 100, resets_at_sec: null, expired_reset_applied: true };
+    }
+    return win;
+  };
+  const primary = reconcile(snapshot.primary_5h);
+  const secondary = reconcile(snapshot.secondary_weekly);
+  return needsRefresh ? { ...snapshot, primary_5h: primary, secondary_weekly: secondary, needs_live_refresh: true } : snapshot;
+}
+
+function computeProfileId(sessionsRoot = SESSIONS_ROOT) {
+  const normalized = resolve(sessionsRoot || SESSIONS_ROOT);
+  const key = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  return createHash('sha256').update(key).digest('hex').slice(0, 12);
+}
+
+export function resolveQuotaCachePath(sessionsRoot = SESSIONS_ROOT) {
+  if (process.env.TRI_BRIDGE_QUOTA_CACHE_FILE) return process.env.TRI_BRIDGE_QUOTA_CACHE_FILE;
+  return join(tmpdir(), `agy-gemini-codex-jev-quota-${computeProfileId(sessionsRoot)}.cache.json`);
+}
+
+function sanitizeQuota(snapshot) {
+  if (!snapshot?.ok) return null;
+  const numeric = (value) => typeof value === 'number' && Number.isFinite(value) ? value : null;
+  const window = (win) => {
+    if (!win || numeric(win.used_pct) === null || numeric(win.remaining_pct) === null) return null;
+    return { used_pct: clampPct(win.used_pct), remaining_pct: clampPct(win.remaining_pct),
+      window_mins: numeric(win.window_mins), resets_at_sec: numeric(win.resets_at_sec) };
+  };
+  const primary = window(snapshot.primary_5h);
+  const secondary = window(snapshot.secondary_weekly);
+  if (!primary && !secondary) return null;
+  return { ok: true,
+    source: ['app_server_live', 'session_rollout', 'live+rollout'].includes(snapshot.source) ? snapshot.source : 'session_rollout',
+    plan_type: ['free', 'go', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu', 'unknown'].includes(snapshot.plan_type) ? snapshot.plan_type : null,
+    ordinary_usage_allowed: snapshot.ordinary_usage_allowed !== false,
+    primary_5h: primary, secondary_weekly: secondary,
+    reset_credits_count: numeric(snapshot.reset_credits_count), fetched_at_ms: numeric(snapshot.fetched_at_ms) };
+}
+
+function persistQuotaSnapshot(snapshot, sessionsRoot = SESSIONS_ROOT) {
+  const safe = sanitizeQuota(snapshot);
+  if (!safe) return;
+  const cachePath = resolveQuotaCachePath(sessionsRoot);
+  const tempPath = `${cachePath}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(cachePath), { recursive: true });
+    const json = JSON.stringify({ ...safe, profile_id: computeProfileId(sessionsRoot) });
+    writeFileSync(tempPath, json, 'utf8');
+    try { renameSync(tempPath, cachePath); } catch { writeFileSync(cachePath, json, 'utf8'); }
+  } catch {
+    // Cache failures must not interrupt synchronization.
+  } finally {
+    try { unlinkSync(tempPath); } catch {}
+  }
+}
+
+export function peekCachedCodexQuotaSnapshot(nowMs = Date.now(), { sessionsRoot, cachePath } = {}) {
+  const activeSessionsRoot = sessionsRoot || SESSIONS_ROOT;
+  const useDefaultProfile = !sessionsRoot && !cachePath;
+  if (useDefaultProfile && cachedSnapshot?.ok) return reconcileExpiredWindows(cachedSnapshot, nowMs);
+  try {
+    const parsed = JSON.parse(readFileSync(cachePath || resolveQuotaCachePath(activeSessionsRoot), 'utf8'));
+    if (parsed?.profile_id && parsed.profile_id !== computeProfileId(activeSessionsRoot)) {
+      return reconcileExpiredWindows(readLatestRolloutRateLimits(activeSessionsRoot, nowMs), nowMs);
+    }
+    const disk = sanitizeQuota(parsed);
+    if (disk) return reconcileExpiredWindows(disk, nowMs);
+  } catch {}
+  return reconcileExpiredWindows(readLatestRolloutRateLimits(activeSessionsRoot, nowMs), nowMs);
 }
 
 /**
  * 通过 codex app-server --stdio 实时拉取官方剩余额度与重置券信息。
  * @param {number} [timeoutMs=8000]
  */
-export function fetchLiveCodexRateLimits(timeoutMs = 8000) {
+export function fetchLiveCodexRateLimits(timeoutMs = 12000) {
   const binary = discoverCodexBinary();
   if (!binary.found) {
     return Promise.resolve({
@@ -224,6 +291,7 @@ export function fetchLiveCodexRateLimits(timeoutMs = 8000) {
   }
 
   const childEnv = { ...process.env };
+  Object.assign(childEnv, resolveSubprocessProxyEnv(childEnv));
   const gitBinDir = discoverGitBinDir();
   const extraDirs = [binary.binDir, gitBinDir].filter(Boolean);
   if (extraDirs.length > 0) {
@@ -359,7 +427,7 @@ export function fetchLiveCodexRateLimits(timeoutMs = 8000) {
         `${JSON.stringify({
           id: 1,
           method: 'initialize',
-          params: { clientInfo: { name: 'gemini-codex-jev-quota', version: '0.2.0' } },
+          params: { clientInfo: { name: 'gemini-codex-jev-quota', version: '0.4.0' } },
         })}\n`,
       );
     } catch (err) {
@@ -386,40 +454,40 @@ function isPastReset(snapshot, nowMs) {
  */
 export async function getCodexQuotaSnapshot({ forceLive = false } = {}) {
   const nowMs = Date.now();
-  const cacheExpired =
-    !cachedSnapshot ||
-    nowMs - cachedSnapshot.fetched_at_ms >= LIVE_CACHE_TTL_MS ||
-    isPastReset(cachedSnapshot, nowMs);
-
-  if (forceLive || cacheExpired) {
-    const live = await fetchLiveCodexRateLimits(8000);
-    if (live?.ok) {
-      cachedSnapshot = live;
-      return live;
+  if (!forceLive && cachedSnapshot?.source === 'app_server_live' &&
+    nowMs - cachedSnapshot.fetched_at_ms < LIVE_CACHE_TTL_MS &&
+    !cachedSnapshot.needs_live_refresh && !isPastReset(cachedSnapshot, nowMs)) {
+    const rollout = readLatestRolloutRateLimits(SESSIONS_ROOT, nowMs);
+    if (rollout && rollout.observed_at_ms > cachedSnapshot.fetched_at_ms) {
+      cachedSnapshot = { ...cachedSnapshot,
+        primary_5h: rollout.primary_5h || cachedSnapshot.primary_5h,
+        secondary_weekly: rollout.secondary_weekly || cachedSnapshot.secondary_weekly,
+        plan_type: rollout.plan_type || cachedSnapshot.plan_type,
+        needs_live_refresh: Boolean(rollout.needs_live_refresh) };
     }
-    const rollout = readLatestRolloutRateLimits();
-    if (rollout) {
-      return {
-        ...rollout,
-        fallback_reason: live?.message || 'app_server_unavailable',
-        reset_credits_count: cachedSnapshot?.reset_credits_count ?? null,
-      };
+    return reconcileExpiredWindows(cachedSnapshot, nowMs);
+  }
+  if (!forceLive && liveFailCount > 0) {
+    const backoff = Math.min(30_000, 3000 * 2 ** Math.min(liveFailCount - 1, 3));
+    if (nowMs - lastLiveAttemptMs < backoff) {
+      return peekCachedCodexQuotaSnapshot(nowMs) || cachedSnapshot ||
+        { ok: false, error: 'live_backoff', message: '正在等待重试同步 Codex 额度' };
     }
-    return cachedSnapshot || live;
   }
-
-  // 在 3 分钟缓存窗口内，如最新本地 rollout 刚更新过 rate_limits，零开销同步最新百分比
-  const rollout = readLatestRolloutRateLimits();
-  if (rollout && rollout.observed_at_ms > cachedSnapshot.fetched_at_ms) {
-    cachedSnapshot = {
-      ...cachedSnapshot,
-      source: 'live+rollout',
-      primary_5h: rollout.primary_5h || cachedSnapshot.primary_5h,
-      secondary_weekly: rollout.secondary_weekly || cachedSnapshot.secondary_weekly,
-      plan_type: rollout.plan_type || cachedSnapshot.plan_type,
-      fetched_at_ms: rollout.observed_at_ms,
-    };
+  const live = await fetchLiveCodexRateLimits(12000);
+  lastLiveAttemptMs = Date.now();
+  if (live?.ok) {
+    liveFailCount = 0;
+    cachedSnapshot = live;
+    persistQuotaSnapshot(live);
+    return live;
   }
-
-  return cachedSnapshot;
+  liveFailCount += 1;
+  const fallback = readLatestRolloutRateLimits(SESSIONS_ROOT, nowMs) || peekCachedCodexQuotaSnapshot(nowMs);
+  if (fallback) {
+    cachedSnapshot = reconcileExpiredWindows({ ...fallback,
+      reset_credits_count: cachedSnapshot?.reset_credits_count ?? null }, Date.now());
+    return cachedSnapshot;
+  }
+  return reconcileExpiredWindows(cachedSnapshot || live, Date.now());
 }

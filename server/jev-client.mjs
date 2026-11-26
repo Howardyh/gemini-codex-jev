@@ -377,6 +377,27 @@ function readWindowsRegistryProxy() {
  * @param {string} targetUrl
  * @returns {{ url: URL | null, fromEnv: boolean }}
  */
+let subprocessProxyCache = null;
+let subprocessProxyCheckedAt = 0;
+
+export function resolveSubprocessProxyEnv(baseEnv = process.env) {
+  if (['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']
+    .some((name) => String(baseEnv[name] || '').trim())) return {};
+  if (process.platform !== 'win32') return {};
+  const nowMs = Date.now();
+  if (subprocessProxyCache === null || nowMs - subprocessProxyCheckedAt >= 60_000) {
+    subprocessProxyCheckedAt = nowMs;
+    subprocessProxyCache = '';
+    try {
+      const proxy = new URL(readWindowsRegistryProxy());
+      if (/^https?:$/.test(proxy.protocol) && proxy.hostname) subprocessProxyCache = proxy.href;
+    } catch {
+      // Invalid or unavailable system proxy.
+    }
+  }
+  return subprocessProxyCache ? { HTTPS_PROXY: subprocessProxyCache, HTTP_PROXY: subprocessProxyCache } : {};
+}
+
 function resolveProxyInfo(targetUrl) {
   const target = new URL(targetUrl);
   const noProxy = (process.env.NO_PROXY || process.env.no_proxy || '')

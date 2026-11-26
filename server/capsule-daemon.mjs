@@ -11,13 +11,14 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { formatResetDuration, getCodexQuotaSnapshot } from './codex-quota.mjs';
+import { formatResetDuration, getCodexQuotaSnapshot, peekCachedCodexQuotaSnapshot } from './codex-quota.mjs';
 import { getTypeSafeKeyStatus } from './jev-client.mjs';
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_MANIFEST_PATH = join(dirname(SERVER_DIR), 'plugin.json');
 const LEASE_FILE = join(tmpdir(), 'agy-gemini-codex-jev-capsule.lease.json');
-const POLL_INTERVAL_MS = 3000;
+const POLL_INTERVAL_MS = 1500;
+const LEASE_STALE_MS = 10_000;
 
 function readPluginVersion() {
   try {
@@ -30,7 +31,7 @@ function readPluginVersion() {
   } catch {
     // 忽略清单读取失败
   }
-  return '0.3.0';
+  return '0.4.0';
 }
 
 function isPidAlive(pid) {
@@ -98,6 +99,13 @@ function readActiveDevToolsPorts() {
   return ports;
 }
 
+export function isAntigravityMainPageTarget(target) {
+  return target?.type === 'page' && (
+    /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+(?:\/|$)/i.test(String(target.url || '')) ||
+    /^vscode-file:\/\/vscode-app\/.+\/workbench(?:\.esm|-jetski-agent)?\.html(?:[?#]|$)/i.test(String(target.url || ''))
+  );
+}
+
 async function listPageTargets(port) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 1500);
@@ -107,12 +115,9 @@ async function listPageTargets(port) {
     if (!res.ok) return [];
     const list = await res.json();
     if (!Array.isArray(list)) return [];
-    return list.filter(
-      (t) =>
-        t?.type === 'page' &&
-        typeof t?.webSocketDebuggerUrl === 'string' &&
-        /^https?:\/\/(?:127\.0\.0\.1|localhost)/i.test(String(t?.url || '')),
-    );
+    return list.filter(isAntigravityMainPageTarget).map((t) => ({ ...t,
+      wsUrl: t.webSocketDebuggerUrl || `ws://127.0.0.1:${port}/devtools/page/${encodeURIComponent(String(t.id))}`,
+    }));
   } catch {
     return [];
   } finally {
@@ -212,9 +217,10 @@ function injectedClient(bundleVersion, initialPayload, classifyQuotaTone) {
     const state = {
       version: bundleVersion, payload: initialPayload, pinned: false, hoverOpen: false,
       closeTimer: null, refreshTimer: null, animationTimer: null, wasVisible: false,
-      forceRefreshPending: false, refreshing: false, disposed: false,
+      refreshReqSeq: 0, ackRefreshSeq: 0, lastLiveSyncMs: 0, refreshing: false, disposed: false,
       appearanceTargets: [], appearanceObservers: [], observer: null,
     };
+    state.refreshReqSeq = Number(initialPayload?.ack_refresh_seq || 0);
     window.__AGCodexQuotaState = state;
 
     const tokens = `
@@ -489,6 +495,10 @@ function injectedClient(bundleVersion, initialPayload, classifyQuotaTone) {
     function syncPortalVisibility() {
       const visible = state.pinned || state.hoverOpen;
       const wasVisible = state.wasVisible;
+      if (!wasVisible && visible && Date.now() - state.lastLiveSyncMs > 20_000 && !state.refreshing) {
+        state.refreshReqSeq += 1;
+        setRefreshing(true);
+      }
       // 仅从关闭到可见时播放；轮询、固定切换和重排均保持静止。
       if (!wasVisible && visible) cardEl.classList.remove('is-instant');
       else cardEl.classList.add('is-instant');
@@ -545,13 +555,8 @@ function injectedClient(bundleVersion, initialPayload, classifyQuotaTone) {
     function requestRefresh(event) {
       event.preventDefault();
       event.stopPropagation();
-      state.forceRefreshPending = true;
+      state.refreshReqSeq += 1;
       setRefreshing(true);
-      clearTimeout(state.refreshTimer);
-      state.refreshTimer = setTimeout(() => {
-        state.forceRefreshPending = false;
-        setRefreshing(false);
-      }, 15000);
     }
     btnEl.addEventListener('contextmenu', requestRefresh);
     refreshBtn.addEventListener('click', requestRefresh);
@@ -606,7 +611,14 @@ function injectedClient(bundleVersion, initialPayload, classifyQuotaTone) {
       q('jev').textContent = data?.jev_ready ? 'Jev 就绪' : 'Jev 未配置';
       q('updated').textContent = data?.updated_label || '--';
       // 请求被守护进程消费后，下一份 payload 才结束刷新反馈。
-      if (!state.forceRefreshPending) {
+      state.ackRefreshSeq = Math.max(state.ackRefreshSeq, Number(data?.ack_refresh_seq || 0));
+      state.refreshReqSeq = Math.max(state.refreshReqSeq, state.ackRefreshSeq);
+      if (data?.quota?.source === 'app_server_live') {
+        const fetchedMs = Number(data?.quota?.fetched_at_ms || 0);
+        if (fetchedMs > 0) state.lastLiveSyncMs = Math.max(state.lastLiveSyncMs, fetchedMs);
+      }
+      if (data?.syncing) setRefreshing(true);
+      if (!data?.syncing && state.ackRefreshSeq >= state.refreshReqSeq) {
         clearTimeout(state.refreshTimer);
         setRefreshing(false);
       }
@@ -628,12 +640,8 @@ function injectedClient(bundleVersion, initialPayload, classifyQuotaTone) {
     }
     window.__AGCodexQuotaUpdate = render;
     window.__AGCodexQuotaEnsureMounted = ensureMounted;
-    const consumeRefresh = () => {
-      const flag = Boolean(state.forceRefreshPending);
-      state.forceRefreshPending = false;
-      return flag;
-    };
-    window.__AGCodexQuotaConsumeRefresh = consumeRefresh;
+    window.__AGCodexQuotaPeekRefreshSeq = () => Number(state.refreshReqSeq || 0);
+    window.__AGCodexQuotaConsumeRefresh = () => state.refreshReqSeq > state.ackRefreshSeq;
     const dispose = () => {
       state.disposed = true;
       clearTimeout(state.closeTimer);
@@ -653,6 +661,7 @@ function injectedClient(bundleVersion, initialPayload, classifyQuotaTone) {
         delete window.__AGCodexQuotaUpdate;
         delete window.__AGCodexQuotaEnsureMounted;
         delete window.__AGCodexQuotaConsumeRefresh;
+        delete window.__AGCodexQuotaPeekRefreshSeq;
         delete window.__AGCodexQuotaDispose;
         delete window.__AGCodexQuotaState;
       }
@@ -672,7 +681,7 @@ function injectedClient(bundleVersion, initialPayload, classifyQuotaTone) {
 }
 
 
-export function buildClientPayload(quotaSnapshot, jevStatus, nowMs = Date.now()) {
+export function buildClientPayload(quotaSnapshot, jevStatus, nowMs = Date.now(), opts = undefined) {
   const now = new Date(nowMs);
   const hh = String(now.getHours()).padStart(2, '0');
   const mm = String(now.getMinutes()).padStart(2, '0');
@@ -683,48 +692,46 @@ export function buildClientPayload(quotaSnapshot, jevStatus, nowMs = Date.now())
     p7_reset_text: formatResetDuration(quotaSnapshot?.secondary_weekly?.resets_at_sec, now.getTime()),
     jev_ready: Boolean(jevStatus?.present),
     updated_label: `${hh}:${mm}:${ss}`,
+    ...(opts === undefined ? {} : {
+      ack_refresh_seq: Number(opts.ackRefreshSeq || 0), syncing: Boolean(opts.syncing),
+    }),
   };
 }
 
+async function tryAcquireOrRenewLease(version) {
+  let existing = null;
+  try { existing = JSON.parse(readFileSync(LEASE_FILE, 'utf8')); } catch {}
+  const alive = isPidAlive(existing?.pid);
+  const nowMs = Date.now();
+  const stale = !Number.isFinite(Number(existing?.heartbeatAt)) ||
+    nowMs - Number(existing?.heartbeatAt || 0) > LEASE_STALE_MS;
+  if (existing?.pid !== process.pid && alive && !stale && existing.version === version) return false;
+  if (existing?.pid !== process.pid && alive && existing.version !== version) {
+    try { process.kill(existing.pid, 'SIGTERM'); } catch {}
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
+  }
+  try {
+    writeFileSync(LEASE_FILE, JSON.stringify({ pid: process.pid, version,
+      startedAt: existing?.pid === process.pid ? existing.startedAt : nowMs,
+      heartbeatAt: Date.now() }), 'utf8');
+    return true;
+  } catch { return false; }
+}
+
+function holdsLease() {
+  try { return JSON.parse(readFileSync(LEASE_FILE, 'utf8'))?.pid === process.pid; }
+  catch { return false; }
+}
 /**
  * 启动 Antigravity 顶栏胶囊后台守护。
  */
 export async function startCapsuleDaemon() {
   const version = readPluginVersion();
 
-  // 检查单实例租约：若已有旧实例存活且版本一致则不重复启动；版本不同则替换旧实例
-  try {
-    if (existsSync(LEASE_FILE)) {
-      const existing = JSON.parse(readFileSync(LEASE_FILE, 'utf8'));
-      if (existing?.pid && existing.pid !== process.pid && isPidAlive(existing.pid)) {
-        if (existing.version === version) {
-          process.exit(0);
-          return;
-        }
-        try {
-          process.kill(existing.pid, 'SIGTERM');
-        } catch {
-          // 忽略无法强杀
-        }
-        await new Promise((r) => setTimeout(r, 300));
-      }
-    }
-  } catch {
-    // 忽略损坏的租约文件
-  }
-
-  try {
-    writeFileSync(
-      LEASE_FILE,
-      JSON.stringify({ pid: process.pid, version, startedAt: new Date().toISOString() }),
-      'utf8',
-    );
-  } catch {
-    // 忽略租约写入异常
-  }
-
   let shuttingDown = false;
   let syncInFlight = false;
+  let lastAckedRefreshSeq = 0;
+  let pendingExternalForce = false;
   let cachedJevStatus = getTypeSafeKeyStatus();
   let lastJevCheckMs = Date.now();
 
@@ -734,52 +741,67 @@ export async function startCapsuleDaemon() {
     for (const port of ports) {
       const pages = await listPageTargets(port);
       for (const page of pages) {
-        if (page.webSocketDebuggerUrl && !urls.includes(page.webSocketDebuggerUrl)) {
-          urls.push(page.webSocketDebuggerUrl);
+        if (page.wsUrl && !urls.includes(page.wsUrl)) {
+          urls.push(page.wsUrl);
         }
       }
     }
     return urls;
   }
 
-  async function syncOnce() {
+  async function syncOnce({ externalForce = false } = {}) {
+    pendingExternalForce ||= externalForce;
     if (shuttingDown || syncInFlight) return;
     syncInFlight = true;
+    let heartbeatTimer;
     try {
+      if (!(await tryAcquireOrRenewLease(version))) return;
+      // Keep a fresh heartbeat while a live request is pending.
+      heartbeatTimer = setInterval(() => {
+        if (!shuttingDown && holdsLease()) void tryAcquireOrRenewLease(version);
+      }, POLL_INTERVAL_MS);
       const wsUrls = await collectAllPageUrls();
-      if (wsUrls.length === 0) return;
-
-      // 先检测页面内是否点击了“刷新”按钮
-      let forceLive = false;
-      for (const wsUrl of wsUrls) {
-        const res = await evaluateCdp(wsUrl, 'Boolean(window.__AGCodexQuotaConsumeRefresh?.())');
-        if (res === true) forceLive = true;
-      }
-
+      if (wsUrls.length === 0 || shuttingDown || !holdsLease()) return;
+      let maxReqSeq = lastAckedRefreshSeq;
+      await Promise.allSettled(wsUrls.map(async (wsUrl) => {
+        const probe = await evaluateCdp(wsUrl, `({ mounted: Boolean(document.getElementById('ag-codex-quota-capsule')), reqSeq: Number(window.__AGCodexQuotaPeekRefreshSeq?.() || 0), ver: window.__AGCodexQuotaState?.version || '' })`);
+        maxReqSeq = Math.max(maxReqSeq, Number(probe?.reqSeq || 0));
+        if (!probe?.mounted || probe.ver !== version) {
+          const peek = peekCachedCodexQuotaSnapshot();
+          const initial = buildClientPayload(peek, cachedJevStatus, Date.now(), {
+            ackRefreshSeq: lastAckedRefreshSeq, syncing: true,
+          });
+          if (!shuttingDown && holdsLease()) await evaluateCdp(wsUrl, buildInjectedClientScript(version, initial));
+        }
+      }));
+      const forceLive = maxReqSeq > lastAckedRefreshSeq || pendingExternalForce;
+      pendingExternalForce = false;
       if (Date.now() - lastJevCheckMs > 30_000 || forceLive) {
         cachedJevStatus = getTypeSafeKeyStatus();
         lastJevCheckMs = Date.now();
       }
-
       const snapshot = await getCodexQuotaSnapshot({ forceLive });
-      const payload = buildClientPayload(snapshot, cachedJevStatus);
+      if (shuttingDown || !holdsLease()) return;
+      lastAckedRefreshSeq = maxReqSeq;
+      const payload = buildClientPayload(snapshot, cachedJevStatus, Date.now(), {
+        ackRefreshSeq: lastAckedRefreshSeq, syncing: false,
+      });
       const script = buildInjectedClientScript(version, payload);
-
       await Promise.allSettled(wsUrls.map((wsUrl) => evaluateCdp(wsUrl, script)));
     } finally {
+      clearInterval(heartbeatTimer);
       syncInFlight = false;
     }
   }
-
   async function shutdown({ disposeUi = false } = {}) {
     if (shuttingDown) return;
     shuttingDown = true;
     clearInterval(pollTimer);
-    if (disposeUi) {
+    if (disposeUi === true && holdsLease()) {
       try {
         const wsUrls = await collectAllPageUrls();
         await Promise.allSettled(
-          wsUrls.map((wsUrl) => evaluateCdp(wsUrl, 'window.__AGCodexQuotaDispose?.(); true;')),
+          wsUrls.map((wsUrl) => holdsLease() ? evaluateCdp(wsUrl, 'window.__AGCodexQuotaDispose?.(); true;') : null),
         );
       } catch {
         // 忽略卸载清理异常
@@ -802,10 +824,14 @@ export async function startCapsuleDaemon() {
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (chunk) => {
       stdinBuf += String(chunk || '');
-      if (stdinBuf.includes('SHUTDOWN_DISPOSE')) {
-        void shutdown({ disposeUi: true });
+      let newline;
+      while ((newline = stdinBuf.indexOf('\n')) !== -1) {
+        const command = stdinBuf.slice(0, newline).trim();
+        stdinBuf = stdinBuf.slice(newline + 1);
+        if (command === 'SHUTDOWN_DISPOSE') void shutdown({ disposeUi: true });
+        if (command === 'FORCE_REFRESH') void syncOnce({ externalForce: true });
       }
-      if (stdinBuf.length > 4096) stdinBuf = stdinBuf.slice(-1024);
+      if (stdinBuf.length > 4096) stdinBuf = '';
     });
     process.stdin.on('end', () => void shutdown({ disposeUi: false }));
     process.stdin.on('close', () => void shutdown({ disposeUi: false }));

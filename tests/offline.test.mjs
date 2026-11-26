@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { deflateSync } from 'node:zlib';
@@ -11,10 +11,11 @@ const MCP_SERVER_PATH = join(PLUGIN_ROOT, 'server', 'mcp-server.mjs');
 const JEV_CLIENT_URL = pathToFileURL(join(PLUGIN_ROOT, 'server', 'jev-client.mjs')).href;
 const CODEX_QUOTA_URL = pathToFileURL(join(PLUGIN_ROOT, 'server', 'codex-quota.mjs')).href;
 
-const { interpretJevAnswers } = await import(JEV_CLIENT_URL);
-const { formatResetDuration, normalizeAppServerRateLimits, normalizeRolloutRateLimits } =
+const { interpretJevAnswers, resolveSubprocessProxyEnv } = await import(JEV_CLIENT_URL);
+const { formatResetDuration, normalizeAppServerRateLimits, normalizeRolloutRateLimits,
+  findRecentRolloutFiles, readLatestRolloutRateLimits, reconcileExpiredWindows, peekCachedCodexQuotaSnapshot, resolveQuotaCachePath } =
   await import(CODEX_QUOTA_URL);
-const { classifyQuotaTone, buildClientPayload, buildInjectedClientScript, resolveDevToolsPortCandidates } =
+const { classifyQuotaTone, buildClientPayload, buildInjectedClientScript, resolveDevToolsPortCandidates, isAntigravityMainPageTarget } =
   await import('../server/capsule-daemon.mjs');
 
 function runCapsuleChecks() {
@@ -47,7 +48,7 @@ function runCapsuleChecks() {
     'wm-capsule-btn', 'wm-cap-slot', 'wm-sep', 'wm-popover-in', 'anim-modern-pop-in',
     'is-instant', 'wm-spin-icon', 'ag-usage-monitor-portal', 'contextmenu', 'quota-pool-row',
     'data-color-scheme', 'data-modern-ui', 'data-font-scale', 'data-layout', 'syncHostAppearance',
-    'wm-popover-in-up', 'anim-modern-pop-in-up', 'wm-pin-badge', 'forceRefreshPending',
+    'wm-popover-in-up', 'anim-modern-pop-in-up', 'wm-pin-badge', 'refreshReqSeq',
     "removeEventListener('resize'", "removeEventListener('click'", "removeEventListener('keydown'",
   ]) assert.ok(script.includes(marker), `注入脚本缺少 ${marker}`);
   assert.ok(script.includes("if (!wasVisible && visible) cardEl.classList.remove('is-instant')"));
@@ -65,12 +66,59 @@ function runCapsuleChecks() {
     /\b[a-z0-9.]+_\d+\.\d+\.\d+\.\d+_(?:x64|arm64|x86)__[a-z0-9]+\b/i,
   ];
   for (const pattern of piiPatterns) assert.doesNotMatch(script, pattern);
-  for (const name of ['server/capsule-daemon.mjs', 'tests/offline.test.mjs', 'README.md', 'package.json', 'plugin.json']) {
+  const guardedFiles = new Set();
+  const collectFiles = (dir, relBase = '') => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === 'local' || entry.name.startsWith('.offline-')) {
+        continue;
+      }
+      const rel = relBase ? `${relBase}/${entry.name}` : entry.name;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) collectFiles(full, rel);
+      else if (/\.(?:mjs|cjs|js|ts|tsx|jsx|json|md|css|html|svg|ya?ml|txt|ps1)$/i.test(entry.name)) {
+        guardedFiles.add(rel);
+      }
+    }
+  };
+  collectFiles(PLUGIN_ROOT);
+  for (const extra of ['skills/tri/SKILL.md', 'skills/tri/logo.svg', 'assets/logo.svg']) guardedFiles.add(extra);
+  const forbiddenSubstring = String.fromCharCode(102, 108, 111, 97, 116);
+  for (const name of guardedFiles) {
     const content = readFileSync(join(PLUGIN_ROOT, name), 'utf8');
     for (const pattern of piiPatterns) assert.doesNotMatch(content, pattern, `${name} 包含身份信息`);
+    assert.ok(!content.toLowerCase().includes(forbiddenSubstring), `${name} contains a prohibited substring`);
   }
-  assert.equal(JSON.parse(readFileSync(join(PLUGIN_ROOT, 'plugin.json'), 'utf8')).version, '0.3.0');
-  assert.equal(JSON.parse(readFileSync(join(PLUGIN_ROOT, 'package.json'), 'utf8')).version, '0.3.0');
+  assert.equal(JSON.parse(readFileSync(join(PLUGIN_ROOT, 'plugin.json'), 'utf8')).version, '0.4.0');
+  assert.equal(JSON.parse(readFileSync(join(PLUGIN_ROOT, 'package.json'), 'utf8')).version, '0.4.0');
+  for (const name of ['skills/tri/SKILL.md', 'skills/tri/logo.svg', 'assets/logo.svg']) {
+    assert.ok(existsSync(join(PLUGIN_ROOT, name)), `Missing ${name}`);
+  }
+
+  const syncingPayload = buildClientPayload(quota, { present: true }, nowMs, { ackRefreshSeq: 3, syncing: true });
+  assert.deepEqual(syncingPayload, { ...payload, ack_refresh_seq: 3, syncing: true });
+  assert.deepEqual(buildClientPayload(quota, { present: true }, nowMs, {}), {
+    ...payload, ack_refresh_seq: 0, syncing: false,
+  });
+  const currentScript = buildInjectedClientScript('0.4.0', syncingPayload);
+  assert.doesNotThrow(() => new Function(currentScript));
+  for (const marker of ['refreshReqSeq', 'ack_refresh_seq', '__AGCodexQuotaPeekRefreshSeq', 'lastLiveSyncMs', 'fetched_at_ms']) {
+    assert.ok(currentScript.includes(marker), `Missing ${marker}`);
+  }
+  assert.notEqual(resolveQuotaCachePath(join(PLUGIN_ROOT, '.p1', 'sessions')), resolveQuotaCachePath(join(PLUGIN_ROOT, '.p2', 'sessions')));
+  for (const url of [
+    'http://127.0.0.1:9000/', 'https://localhost:9000', 'http://[::1]:9000/app',
+    'vscode-file://vscode-app/app/out/workbench.html',
+    'vscode-file://vscode-app/app/out/workbench.esm.html?mode=main',
+    'vscode-file://vscode-app/app/out/workbench-jetski-agent.html#main',
+  ]) assert.equal(isAntigravityMainPageTarget({ type: 'page', url }), true, url);
+  for (const url of [
+    'data:text/html,test', 'about:blank', 'vscode-webview://view/index.html',
+    'http://localhost/app', 'http://localhost.example:9000/', 'http://127.0.0.1:9000.evil/',
+    'https://example.invalid:9000/', 'vscode-file://vscode-app/app/workbench.html/extra',
+  ]) assert.equal(isAntigravityMainPageTarget({ type: 'page', url }), false, url);
+  assert.equal(isAntigravityMainPageTarget({ type: 'worker', url: 'http://localhost:9000/' }), false);
+  assert.equal(isAntigravityMainPageTarget(null), false);
+  assert.deepEqual(resolveSubprocessProxyEnv({ HTTPS_PROXY: '  ', http_proxy: 'http://localhost:9001' }), {});
 
   // 合成路径覆盖跨平台发现，不读取本机 DevTools 文件。
   assert.deepEqual(resolveDevToolsPortCandidates({ ANTIGRAVITY_DEVTOOLS_PORT_FILE: 'custom-port-file' }, 'linux', '/virtual'), ['custom-port-file']);
@@ -78,6 +126,61 @@ function runCapsuleChecks() {
   assert.ok(resolveDevToolsPortCandidates({}, 'darwin', '/virtual').includes(join('/virtual', 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort')));
   assert.ok(resolveDevToolsPortCandidates({ XDG_CONFIG_HOME: '/config' }, 'linux', '/virtual').includes(join('/config', 'Antigravity', 'DevToolsActivePort')));
   console.log('[PASS] capsule tone, payload, script syntax, theme/motion structure & zero-PII checks');
+}
+
+function runQuotaRecoveryChecks(tempDir) {
+  const sessionsRoot = join(tempDir, 'sessions');
+  const day = join(sessionsRoot, '2030', '01', '02');
+  const olderDay = join(sessionsRoot, '2029', '12', '31');
+  mkdirSync(day, { recursive: true });
+  mkdirSync(olderDay, { recursive: true });
+  const nowMs = Date.UTC(2030, 0, 2, 12);
+  const newest = join(day, 'newest.jsonl');
+  const usable = join(day, 'usable.jsonl');
+  const older = join(olderDay, 'older.jsonl');
+  const limits = {
+    primary: { used_percent: 81, window_minutes: 300, resets_at: nowMs / 1000 - 1 },
+    secondary: { used_percent: 27, window_minutes: 10080, resets_at: nowMs / 1000 + 86400 },
+    plan_type: 'plus',
+  };
+  writeFileSync(newest, '{"payload":{"message":"no quota yet"}}\n');
+  writeFileSync(usable, `${JSON.stringify({ payload: { rate_limits: limits } })}\n{broken\n`);
+  writeFileSync(older, `${JSON.stringify({ rate_limits: limits })}\n`);
+  for (const [file, delta] of [[newest, 0], [usable, 1000], [older, 2000]]) {
+    utimesSync(file, new Date(nowMs - delta), new Date(nowMs - delta));
+  }
+  assert.deepEqual(findRecentRolloutFiles(sessionsRoot, 8).map((entry) => entry.path), [newest, usable, older]);
+  assert.equal(findRecentRolloutFiles(sessionsRoot, 1)[0].path, newest);
+  assert.deepEqual(findRecentRolloutFiles(sessionsRoot, 0), []);
+  assert.deepEqual(findRecentRolloutFiles(join(tempDir, 'missing')), []);
+  const snapshot = readLatestRolloutRateLimits(sessionsRoot, nowMs);
+  assert.equal(snapshot.source, 'session_rollout');
+  assert.equal(snapshot.observed_at_ms, nowMs - 1000);
+  assert.equal(snapshot.primary_5h.used_pct, 0);
+  assert.equal(snapshot.primary_5h.remaining_pct, 100);
+  assert.equal(snapshot.primary_5h.resets_at_sec, null);
+  assert.equal(snapshot.primary_5h.expired_reset_applied, true);
+  assert.equal(snapshot.secondary_weekly.remaining_pct, 73);
+  assert.equal(snapshot.needs_live_refresh, true);
+  const raw = normalizeRolloutRateLimits(limits, nowMs);
+  const reconciled = reconcileExpiredWindows(raw, nowMs);
+  assert.notEqual(reconciled, raw);
+  assert.equal(raw.primary_5h.used_pct, 81);
+  assert.equal(reconciled.secondary_weekly, raw.secondary_weekly);
+  assert.equal(reconcileExpiredWindows(raw, nowMs - 2000), raw);
+  assert.equal(reconcileExpiredWindows(null, nowMs), null);
+  const failure = { ok: false };
+  assert.equal(reconcileExpiredWindows(failure, nowMs), failure);
+  // Missing/corrupt files fall through to another day.
+  writeFileSync(usable, '{broken\n');
+  assert.equal(readLatestRolloutRateLimits(sessionsRoot, nowMs).observed_at_ms, nowMs - 2000);
+  const cachePath = join(tempDir, 'quota.cache.json');
+  assert.equal(peekCachedCodexQuotaSnapshot(nowMs, { sessionsRoot, cachePath }).observed_at_ms, nowMs - 2000);
+  writeFileSync(cachePath, JSON.stringify({ ...raw, extra: 'discard', plan_type: 'untrusted' }));
+  const peek = peekCachedCodexQuotaSnapshot(nowMs, { sessionsRoot, cachePath });
+  assert.equal(peek.extra, undefined);
+  assert.equal(peek.plan_type, null);
+  assert.equal(peek.primary_5h.remaining_pct, 100);
 }
 
 function crc32(buf) {
@@ -317,6 +420,7 @@ async function main() {
   writeFileSync(smallPng, createSolidPng(100, 100));
 
   try {
+    runQuotaRecoveryChecks(tempDir);
     const gates = interpretJevAnswers(
       {
         needs_write_sandbox: { type: 'noul', noul: 0.98 },
